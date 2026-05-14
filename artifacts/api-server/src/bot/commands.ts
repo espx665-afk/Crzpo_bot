@@ -1,3 +1,4 @@
+import { spawn } from "child_process";
 import {
   Message,
   GuildMember,
@@ -8,22 +9,74 @@ import {
   joinVoiceChannel,
   createAudioPlayer,
   createAudioResource,
+  StreamType,
   AudioPlayerStatus,
   VoiceConnectionStatus,
   entersState,
 } from "@discordjs/voice";
-import play from "play-dl";
 import { queues, type GuildQueue, type Song } from "./queue.js";
 import { logger } from "../lib/logger.js";
 
 const PREFIX = "!";
 
 function formatDuration(seconds: number): string {
+  if (!seconds || isNaN(seconds)) return "?:??";
   const h = Math.floor(seconds / 3600);
   const m = Math.floor((seconds % 3600) / 60);
-  const s = seconds % 60;
+  const s = Math.floor(seconds % 60);
   if (h > 0) return `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
   return `${m}:${String(s).padStart(2, "0")}`;
+}
+
+function ytdlpInfo(query: string): Promise<{ title: string; url: string; duration: number }> {
+  return new Promise((resolve, reject) => {
+    const isUrl = query.startsWith("http://") || query.startsWith("https://");
+    const target = isUrl ? query : `ytsearch1:${query}`;
+
+    const proc = spawn("yt-dlp", [
+      "--dump-json",
+      "--no-playlist",
+      "--quiet",
+      target,
+    ]);
+
+    let raw = "";
+    let errOut = "";
+    proc.stdout.on("data", (d: Buffer) => { raw += d.toString(); });
+    proc.stderr.on("data", (d: Buffer) => { errOut += d.toString(); });
+    proc.on("close", (code) => {
+      if (code !== 0) {
+        reject(new Error(`yt-dlp info failed (${code}): ${errOut}`));
+        return;
+      }
+      try {
+        const json = JSON.parse(raw.trim().split("\n")[0]);
+        resolve({
+          title: json.title ?? "Unknown",
+          url: json.webpage_url ?? json.url,
+          duration: json.duration ?? 0,
+        });
+      } catch (err) {
+        reject(new Error(`Failed to parse yt-dlp output: ${errOut}`));
+      }
+    });
+  });
+}
+
+function ytdlpStream(url: string) {
+  const proc = spawn("yt-dlp", [
+    "-f", "bestaudio",
+    "-o", "-",
+    "--no-playlist",
+    "--quiet",
+    url,
+  ]);
+
+  proc.stderr.on("data", (d: Buffer) => {
+    logger.warn({ msg: d.toString().trim() }, "yt-dlp stderr");
+  });
+
+  return proc.stdout;
 }
 
 async function playNextSong(guildId: string, channel: TextChannel): Promise<void> {
@@ -35,9 +88,9 @@ async function playNextSong(guildId: string, channel: TextChannel): Promise<void
 
   const song = queue.songs[0];
   try {
-    const stream = await play.stream(song.url, { quality: 2 });
-    const resource = createAudioResource(stream.stream, {
-      inputType: stream.type,
+    const stream = ytdlpStream(song.url);
+    const resource = createAudioResource(stream, {
+      inputType: StreamType.Arbitrary,
     });
 
     queue.audioPlayer.play(resource);
@@ -80,32 +133,13 @@ export async function handlePlay(message: Message, args: string[]): Promise<void
   await message.react("⏳").catch(() => {});
 
   try {
-    let songInfo: Song;
-    const isUrl = query.startsWith("http://") || query.startsWith("https://");
-
-    if (isUrl) {
-      const info = await play.video_info(query);
-      const details = info.video_details;
-      songInfo = {
-        title: details.title ?? "Unknown",
-        url: details.url,
-        duration: formatDuration(details.durationInSec),
-        requestedBy: message.author.username,
-      };
-    } else {
-      const results = await play.search(query, { limit: 1 });
-      if (!results.length) {
-        message.reply("No results found for your search.").catch(() => {});
-        return;
-      }
-      const video = results[0];
-      songInfo = {
-        title: video.title ?? "Unknown",
-        url: video.url,
-        duration: formatDuration(video.durationInSec ?? 0),
-        requestedBy: message.author.username,
-      };
-    }
+    const info = await ytdlpInfo(query);
+    const songInfo: Song = {
+      title: info.title,
+      url: info.url,
+      duration: formatDuration(info.duration),
+      requestedBy: message.author.username,
+    };
 
     let queue = queues.get(guildId);
     if (!queue) {
@@ -171,7 +205,7 @@ export async function handlePlay(message: Message, args: string[]): Promise<void
     }
   } catch (err) {
     logger.error({ err }, "Error in play command");
-    message.reply("An error occurred while trying to play the song.").catch(() => {});
+    message.reply("Could not find or play that song. Try a different search or URL.").catch(() => {});
   }
 }
 
