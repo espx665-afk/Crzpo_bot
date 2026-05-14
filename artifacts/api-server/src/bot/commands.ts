@@ -1,4 +1,5 @@
 import { spawn } from "child_process";
+import ffmpegPath from "ffmpeg-static";
 import {
   Message,
   GuildMember,
@@ -14,7 +15,7 @@ import {
   VoiceConnectionStatus,
   entersState,
 } from "@discordjs/voice";
-import { queues, type GuildQueue, type Song } from "./queue.js";
+import { queues, type Song } from "./queue.js";
 import { logger } from "../lib/logger.js";
 
 const PREFIX = "!";
@@ -64,7 +65,9 @@ function ytdlpInfo(query: string): Promise<{ title: string; url: string; duratio
 }
 
 function ytdlpStream(url: string) {
-  const proc = spawn("yt-dlp", [
+  if (!ffmpegPath) throw new Error("ffmpeg-static binary not found");
+
+  const ytdlp = spawn("yt-dlp", [
     "-f", "bestaudio",
     "-o", "-",
     "--no-playlist",
@@ -72,11 +75,27 @@ function ytdlpStream(url: string) {
     url,
   ]);
 
-  proc.stderr.on("data", (d: Buffer) => {
+  const ffmpeg = spawn(ffmpegPath, [
+    "-i", "pipe:0",
+    "-f", "s16le",
+    "-ar", "48000",
+    "-ac", "2",
+    "-loglevel", "error",
+    "pipe:1",
+  ]);
+
+  ytdlp.stdout.pipe(ffmpeg.stdin);
+
+  ytdlp.stderr.on("data", (d: Buffer) => {
     logger.warn({ msg: d.toString().trim() }, "yt-dlp stderr");
   });
+  ffmpeg.stderr.on("data", (d: Buffer) => {
+    logger.warn({ msg: d.toString().trim() }, "ffmpeg stderr");
+  });
+  ytdlp.on("error", (err) => logger.error({ err }, "yt-dlp process error"));
+  ffmpeg.on("error", (err) => logger.error({ err }, "ffmpeg process error"));
 
-  return proc.stdout;
+  return ffmpeg.stdout;
 }
 
 async function playNextSong(guildId: string, channel: TextChannel): Promise<void> {
@@ -90,7 +109,7 @@ async function playNextSong(guildId: string, channel: TextChannel): Promise<void
   try {
     const stream = ytdlpStream(song.url);
     const resource = createAudioResource(stream, {
-      inputType: StreamType.Arbitrary,
+      inputType: StreamType.Raw,
     });
 
     queue.audioPlayer.play(resource);
