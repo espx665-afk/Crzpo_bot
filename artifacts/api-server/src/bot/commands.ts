@@ -1,5 +1,4 @@
 import { spawn } from "child_process";
-import ffmpegPath from "ffmpeg-static";
 import {
   Message,
   GuildMember,
@@ -65,8 +64,6 @@ function ytdlpInfo(query: string): Promise<{ title: string; url: string; duratio
 }
 
 function ytdlpStream(url: string) {
-  if (!ffmpegPath) throw new Error("ffmpeg-static binary not found");
-
   const ytdlp = spawn("yt-dlp", [
     "-f", "bestaudio",
     "-o", "-",
@@ -75,11 +72,15 @@ function ytdlpStream(url: string) {
     url,
   ]);
 
-  const ffmpeg = spawn(ffmpegPath, [
+  // Use system ffmpeg (has libopus) to encode directly to ogg/opus.
+  // StreamType.OggOpus lets @discordjs/voice pass raw opus frames straight
+  // to Discord — no Node.js opus encoder needed.
+  const ffmpeg = spawn("ffmpeg", [
     "-i", "pipe:0",
-    "-f", "s16le",
-    "-ar", "48000",
-    "-ac", "2",
+    "-c:a", "libopus",
+    "-b:a", "128k",
+    "-vbr", "on",
+    "-f", "ogg",
     "-loglevel", "error",
     "pipe:1",
   ]);
@@ -109,7 +110,7 @@ async function playNextSong(guildId: string, channel: TextChannel): Promise<void
   try {
     const stream = ytdlpStream(song.url);
     const resource = createAudioResource(stream, {
-      inputType: StreamType.Raw,
+      inputType: StreamType.OggOpus,
     });
 
     queue.audioPlayer.play(resource);
